@@ -447,8 +447,9 @@ def _make_job_embed(job: dict, reason: str = "", index: int = 0, total: int = 0,
             status, discord.Color.from_rgb(88, 101, 242)
         )
 
+    raw_title = f"{deadline_badge}{status_prefix}{title}"
     em = discord.Embed(
-        title=f"{deadline_badge}{status_prefix}{title}",
+        title=raw_title[:253] + "…" if len(raw_title) > 256 else raw_title,
         url=url or None,
         color=color,
         timestamp=datetime.datetime.now(timezone.utc),
