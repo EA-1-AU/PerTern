@@ -2541,6 +2541,38 @@ async def slash_clear_dm(interaction: discord.Interaction):
     )
 
 
+def _dedupe_existing_jobs():
+    """Collapse job rows already in the DB that share the same normalized
+    company+title (e.g. the same posting picked up from two different
+    community lists under different job_ids/URLs) down to a single row.
+
+    Keeps whichever copy the user has already interacted with (so applied /
+    skipped / etc. status isn't lost); otherwise keeps the oldest.
+    """
+    uid = str(MY_USER_ID)
+    groups: dict[str, list[dict]] = {}
+    for row in db.get_all_jobs_light():
+        key = _title_key(row["company"], row["title"])
+        groups.setdefault(key, []).append(row)
+
+    removed = 0
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        keeper = group[0]  # oldest, since get_all_jobs_light is first_seen-ordered
+        for row in group:
+            uj = db.get_user_job(uid, row["job_id"])
+            if uj and uj.get("status") not in (None, "", "new"):
+                keeper = row
+                break
+        for row in group:
+            if row["job_id"] != keeper["job_id"]:
+                db.delete_job(row["job_id"])
+                removed += 1
+    if removed:
+        log.info("Deduped %d duplicate job rows already in DB", removed)
+
+
 # ── on_ready ──────────────────────────────────────────────────────────────────
 
 @client.event
@@ -2553,6 +2585,19 @@ async def on_ready():
     from seed_companies import seed
     n, _ = seed()
     log.info("Seeded %d companies from CSV", n)
+
+    _dedupe_existing_jobs()
+
+    # Rebuild in-memory dedup caches from the DB — otherwise a restart wipes
+    # them and the same posting can slip back in under a different job_id/URL
+    # once a new or previously-broken source starts surfacing it too.
+    for _row in db.get_all_jobs_light():
+        _seen_job_ids.add(_row["job_id"])
+        if _row["url"]:
+            _seen_urls.add(_row["url"])
+        _seen_title_keys.add(_title_key(_row["company"], _row["title"]))
+    log.info("Rebuilt dedup cache: %d job IDs, %d title keys, %d URLs",
+              len(_seen_job_ids), len(_seen_title_keys), len(_seen_urls))
 
     try:
         synced = await tree.sync()

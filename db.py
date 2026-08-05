@@ -372,6 +372,28 @@ def get_job_count():
         return cur.fetchone()[0]
 
 
+def delete_job(job_id: str):
+    """Remove a job and every row that references it (used to collapse dupes)."""
+    with db_cursor(commit=True) as cur:
+        cur.execute("DELETE FROM jobs WHERE job_id=?", (job_id,))
+        cur.execute("DELETE FROM user_jobs WHERE job_id=?", (job_id,))
+        cur.execute("DELETE FROM job_history WHERE job_id=?", (job_id,))
+        cur.execute("DELETE FROM reminders WHERE job_id=?", (job_id,))
+        cur.execute("DELETE FROM job_ratings WHERE job_id=?", (job_id,))
+
+
+def get_all_jobs_light() -> list:
+    """Minimal (job_id, company, title, url) for every stored job.
+
+    Used to rebuild in-memory dedup caches on startup, since a restart
+    would otherwise reset them and let the same posting back in under a
+    different job_id/URL from another source.
+    """
+    with db_cursor() as cur:
+        cur.execute("SELECT job_id, company, title, url FROM jobs ORDER BY first_seen ASC")
+        return [dict(r) for r in cur.fetchall()]
+
+
 def get_recent_jobs(since_iso: str) -> list:
     with db_cursor() as cur:
         cur.execute(
