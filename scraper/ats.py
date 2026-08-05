@@ -275,7 +275,7 @@ def fetch_simplify(company):
     """
     Fetches the SimplifyJobs GitHub internship listings JSON.
     URL in companies.csv should point to the raw GitHub JSON, e.g.:
-    https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/dev/.github/scripts/listings.json
+    https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/dev/.github/scripts/listings.json
     """
     r = requests.get(company["url"], headers=USER_AGENT, timeout=30)
     r.raise_for_status()
@@ -310,11 +310,19 @@ def fetch_simplify(company):
     return jobs
 
 
+_GITHUB_MD_COMPANY_HEADERS  = {"company", "employer"}
+_GITHUB_MD_ROLE_HEADERS     = {"role", "position", "title"}
+_GITHUB_MD_LOCATION_HEADERS = {"location"}
+_GITHUB_MD_APPLY_HEADERS    = {"apply", "application", "application/link", "link", "apply link"}
+
+
 def fetch_github_md_table(company):
     """
-    Parses a GitHub README markdown table with columns:
-    Company | Role | Location | Apply | Added
-    Used for community-maintained GitHub markdown internship lists.
+    Parses a GitHub README markdown table used by community-maintained
+    GitHub internship lists. Column order and count vary between repos
+    (some insert Category/Skills/Posted/Visa columns), so the header row
+    is used to locate the Company/Role/Location/Apply columns rather than
+    assuming a fixed position.
     company["url"] should be the raw README URL.
     """
     r = requests.get(company["url"], headers=USER_AGENT, timeout=30)
@@ -326,7 +334,14 @@ def fetch_github_md_table(company):
         r'☀-⛿'
         r'✀-➿]+',
     )
+    _BOLD_RE = re.compile(r'\*\*(.*?)\*\*')
+
+    def clean(text):
+        text = _BOLD_RE.sub(r'\1', text)
+        return _EMOJI_RE.sub('', text).strip()
+
     jobs = []
+    col_idx = {"company": 0, "role": 1, "location": 2, "apply": 3}
     for line in text.splitlines():
         line = line.strip()
         if not line.startswith('|') or '---' in line:
@@ -334,21 +349,42 @@ def fetch_github_md_table(company):
         cols = [c.strip() for c in line.strip('|').split('|')]
         if len(cols) < 4:
             continue
-        comp_name, title_raw, location, apply_col = cols[0], cols[1], cols[2], cols[3]
-        # Skip header row
-        if title_raw.lower() in ('role', 'position', 'title'):
+        header_cells = [clean(c).lower() for c in cols]
+        # Header row: (re)map columns by name instead of assuming a fixed position
+        if header_cells[0] in _GITHUB_MD_COMPANY_HEADERS and any(
+            h in _GITHUB_MD_ROLE_HEADERS for h in header_cells
+        ):
+            idx = {}
+            for i, h in enumerate(header_cells):
+                if h in _GITHUB_MD_COMPANY_HEADERS:
+                    idx["company"] = i
+                elif h in _GITHUB_MD_ROLE_HEADERS:
+                    idx["role"] = i
+                elif h in _GITHUB_MD_LOCATION_HEADERS:
+                    idx["location"] = i
+                elif h in _GITHUB_MD_APPLY_HEADERS:
+                    idx["apply"] = i
+            if all(k in idx for k in ("company", "role", "location", "apply")):
+                col_idx = idx
             continue
+        if len(cols) <= max(col_idx.values()):
+            continue
+        comp_name  = cols[col_idx["company"]]
+        title_raw  = cols[col_idx["role"]]
+        location   = cols[col_idx["location"]]
+        apply_col  = cols[col_idx["apply"]]
         # Skip closed listings (🔒)
         if '\U0001F512' in title_raw or '\U0001F512' in comp_name:
             continue
-        # Extract apply URL from markdown link [apply](url)
-        url_m = re.search(r'\[.*?\]\((https?://[^\)]+)\)', apply_col)
+        # Extract apply URL from markdown link [apply](url) or an <a href="url"> tag
+        url_m = re.search(r'\[.*?\]\((https?://[^\)]+)\)', apply_col) or re.search(
+            r'href="(https?://[^"]+)"', apply_col
+        )
         if not url_m:
             continue
         url = url_m.group(1)
-        # Clean emojis and flags from title and company
-        title    = _EMOJI_RE.sub('', title_raw).strip()
-        comp_clean = _EMOJI_RE.sub('', comp_name).strip()
+        title      = clean(title_raw)
+        comp_clean = clean(comp_name)
         if not title or not comp_clean:
             continue
         jobs.append({
@@ -356,7 +392,7 @@ def fetch_github_md_table(company):
             "company":  comp_clean,
             "source":   "github_md",
             "title":    title,
-            "location": location.strip(),
+            "location": clean(location),
             "url":      url,
             "description": "",
         })
