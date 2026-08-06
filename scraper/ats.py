@@ -26,9 +26,21 @@ _FULLTIME_BLACKLIST = re.compile(
     re.IGNORECASE,
 )
 
+# Staff roles that run/recruit for an internship program rather than being one
+# (e.g. "Internship Program Manager", "Campus Recruiter — Internships"). These
+# would otherwise pass _INTERN_WHITELIST on the word "internship" alone.
+_INTERN_PROGRAM_STAFF_RE = re.compile(
+    r'\b(internship\s+program\s+(manager|coordinator|lead)|'
+    r'campus\s+recruit(er|ing|ment)|university\s+recruit(er|ing|ment)|'
+    r'early\s+career\s+recruit(er|ing)|talent\s+acquisition\b.*\bintern(ship)?\s+program)\b',
+    re.IGNORECASE,
+)
+
 
 def is_internship_title(title: str) -> bool:
     """Return True only if the job title looks like an internship or student role."""
+    if _INTERN_PROGRAM_STAFF_RE.search(title):
+        return False
     if _INTERN_WHITELIST.search(title):
         return True
     if _FULLTIME_BLACKLIST.search(title):
@@ -164,6 +176,29 @@ def fetch_ashby(company_slug):
     return jobs
 
 
+# SmartRecruiters returns location.country as a raw ISO 3166-1 alpha-2 code
+# (e.g. "in", "ca", "de"), which collides with US state abbreviations if
+# passed straight through — expand it to a full name so downstream US-only
+# filtering isn't fooled by "Bangalore, IN" or "Toronto, CA".
+_ISO_COUNTRY_NAMES = {
+    "us": None, "usa": None,  # omit — redundant with city/state already being US
+    "ca": "Canada", "in": "India", "de": "Germany", "mx": "Mexico",
+    "gb": "United Kingdom", "uk": "United Kingdom", "au": "Australia",
+    "fr": "France", "br": "Brazil", "cn": "China", "jp": "Japan",
+    "sg": "Singapore", "nl": "Netherlands", "kr": "South Korea",
+    "ph": "Philippines", "pk": "Pakistan", "id": "Indonesia",
+    "ng": "Nigeria", "za": "South Africa", "es": "Spain", "it": "Italy",
+    "pl": "Poland", "ie": "Ireland", "il": "Israel", "ua": "Ukraine",
+    "vn": "Vietnam", "eg": "Egypt", "ar": "Argentina", "co": "Colombia",
+    "cl": "Chile", "pe": "Peru", "se": "Sweden", "no": "Norway",
+    "dk": "Denmark", "fi": "Finland", "ch": "Switzerland", "at": "Austria",
+    "be": "Belgium", "pt": "Portugal", "gr": "Greece", "tr": "Turkey",
+    "ru": "Russia", "tw": "Taiwan", "hk": "Hong Kong", "th": "Thailand",
+    "my": "Malaysia", "nz": "New Zealand", "sa": "Saudi Arabia",
+    "ae": "United Arab Emirates", "qa": "Qatar",
+}
+
+
 def fetch_smartrecruiters(company_slug):
     url = f"https://api.smartrecruiters.com/v1/companies/{company_slug}/postings"
     r = requests.get(url, headers=USER_AGENT, timeout=30)
@@ -175,8 +210,10 @@ def fetch_smartrecruiters(company_slug):
         if not is_internship_title(title):
             continue
         loc = job.get("location", {}) or {}
+        country_code = (loc.get("country") or "").strip().lower()
+        country = _ISO_COUNTRY_NAMES.get(country_code, loc.get("country", "")) if country_code else ""
         location_text = ", ".join(
-            p for p in [loc.get("city", ""), loc.get("region", ""), loc.get("country", "")] if p
+            p for p in [loc.get("city", ""), loc.get("region", ""), country] if p
         )
         jobs.append({
             "job_id": f"smartrecruiters:{company_slug}:{job.get('id')}",
@@ -252,21 +289,30 @@ def fetch_workday(company):
         if not postings:
             break
         for p in postings:
+            title = p.get("title", "")
+            # Boards that reject the searchText payload (see _workday_post)
+            # fall back to the full unfiltered listing, so re-check locally
+            # instead of trusting every posting is actually an internship.
+            if not is_internship_title(title):
+                continue
             ext_path = p.get("externalPath", "")
             # externalPath is relative to the board (e.g. /job/Location/Title_ID)
             # Prepend the board so the URL resolves: domain/board/job/Location/Title_ID
             url = f"https://{domain}/{board}{ext_path}" if ext_path else ""
             jobs.append({
-                "job_id":      make_id("workday", company_name, p.get("title", ""), url),
+                "job_id":      make_id("workday", company_name, title, url),
                 "company":     company_name,
                 "source":      "Workday",
-                "title":       p.get("title", ""),
+                "title":       title,
                 "location":    p.get("locationsText", ""),
                 "url":         url,
                 "description": "",
             })
         offset += limit
-        if offset >= data.get("total", 0) or offset >= 200:
+        # Boards with working search rarely have >500 intern hits; boards that
+        # fell back to an unfiltered listing need the higher cap to have a
+        # chance of reaching internships buried past the first 200 postings.
+        if offset >= data.get("total", 0) or offset >= 500:
             break
     return jobs
 
@@ -337,8 +383,14 @@ def fetch_github_md_table(company):
     _BOLD_RE = re.compile(r'\*\*(.*?)\*\*')
 
     def clean(text):
+        # Some lists (e.g. vanshb03) embed raw HTML for multi-location
+        # <details> accordions or <a href> apply buttons — flatten tags to
+        # text instead of leaving markup in what gets shown to the user.
+        if '<' in text and '>' in text:
+            text = BeautifulSoup(text, "html.parser").get_text(", ")
         text = _BOLD_RE.sub(r'\1', text)
-        return _EMOJI_RE.sub('', text).strip()
+        text = _EMOJI_RE.sub('', text)
+        return re.sub(r'\s+', ' ', text).strip()
 
     jobs = []
     col_idx = {"company": 0, "role": 1, "location": 2, "apply": 3}
@@ -392,7 +444,7 @@ def fetch_github_md_table(company):
             "company":  comp_clean,
             "source":   "github_md",
             "title":    title,
-            "location": clean(location),
+            "location": clean(location)[:300],
             "url":      url,
             "description": "",
         })

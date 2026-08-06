@@ -396,7 +396,9 @@ _SEASON_RE    = re.compile(r'\b(summer|fall|spring|winter)\b', re.IGNORECASE)
 
 def guess_category(title: str, description: str = "") -> tuple[str, str | None]:
     """Return (main_category, subcategory). Falls back to ('General / Other', None)."""
-    text = f"{title} {description}".lower()
+    # Padded so space-delimited keywords (e.g. " sre ", " etl ") still match
+    # when that word is the very first or last token in the title.
+    text = f" {title} {description} ".lower()
     for main, sub, keywords in CATEGORY_RULES:
         if any(kw in text for kw in keywords):
             return main, sub

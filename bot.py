@@ -116,7 +116,6 @@ MY_COMPANY_WATCHLIST = {
 
 _US_INDICATORS = [
     "united states", "u.s.", "u.s.a", "usa", " us ",
-    "remote", "nationwide", "hybrid",
     "alabama","alaska","arizona","arkansas","california","colorado",
     "connecticut","delaware","florida","georgia","hawaii","idaho",
     "illinois","indiana","iowa","kansas","kentucky","louisiana",
@@ -127,13 +126,31 @@ _US_INDICATORS = [
     "rhode island","south carolina","south dakota","tennessee","texas",
     "utah","vermont","virginia","washington","west virginia",
     "wisconsin","wyoming",
-    " al "," ak "," az "," ar "," ca "," co "," ct "," de ",
-    " fl "," ga "," hi "," id "," il "," in "," ia "," ks ",
-    " ky "," la "," me "," md "," ma "," mi "," mn "," ms ",
-    " mo "," mt "," ne "," nv "," nh "," nj "," nm "," ny ",
-    " nc "," nd "," oh "," ok "," or "," pa "," ri "," sc ",
-    " sd "," tn "," tx "," ut "," vt "," va "," wa "," wv ",
-    " wi "," wy ",
+]
+
+# Two-letter state codes are only trustworthy in the standard "City, ST"
+# format — matched as bare space-padded substrings they collide with other
+# countries' ISO codes (CA=Canada, IN=India, DE=Germany, ...) and with plain
+# English words (OR). Requiring a preceding comma rules those out.
+_US_STATE_ABBR_RE = re.compile(
+    r',\s*(?:AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|'
+    r'MI|MN|MS|MO|MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|'
+    r'VT|VA|WA|WV|WI|WY|DC)\b',
+    re.IGNORECASE,
+)
+
+# A spelled-out non-US country name is a stronger signal than any
+# coincidentally-matching state abbreviation — check this first.
+_NON_US_COUNTRY_HINTS = [
+    "canada", "india", "germany", "mexico", "united kingdom", "australia",
+    "france", "brazil", "china", "japan", "singapore", "netherlands",
+    "south korea", "philippines", "pakistan", "indonesia", "nigeria",
+    "south africa", "spain", "italy", "poland", "ireland", "israel",
+    "ukraine", "vietnam", "egypt", "argentina", "colombia", "chile", "peru",
+    "sweden", "norway", "denmark", "finland", "switzerland", "austria",
+    "belgium", "portugal", "greece", "turkey", "russia", "taiwan",
+    "hong kong", "thailand", "malaysia", "new zealand", "saudi arabia",
+    "united arab emirates", "qatar",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,11 +289,19 @@ def _db_total_unreviewed() -> int:
 def _is_us_location(location: str) -> bool:
     if not location or location.strip() == "":
         return True
-    loc = f" {location.lower()} "
-    # Accept remote anywhere + any US location; reject everything else
-    if any(w in loc for w in ("remote", "anywhere", "nationwide", "hybrid", "virtual")):
+    loc_lower = location.lower()
+    # A spelled-out foreign country name overrides any coincidental match
+    # below (e.g. "Hybrid - Toronto, Canada" must not pass as US).
+    if any(country in loc_lower for country in _NON_US_COUNTRY_HINTS):
+        return False
+    loc = f" {loc_lower} "
+    # Accept remote/virtual roles anywhere. NOT "hybrid" — that implies a
+    # specific office, so it still has to match a real US indicator below.
+    if any(w in loc for w in ("remote", "anywhere", "nationwide", "virtual")):
         return True
-    return any(ind in loc for ind in _US_INDICATORS)
+    if any(ind in loc for ind in _US_INDICATORS):
+        return True
+    return bool(_US_STATE_ABBR_RE.search(loc_lower))
 
 
 _location_prefs_cache: list[str] = []
@@ -456,7 +481,7 @@ def _make_job_embed(job: dict, reason: str = "", index: int = 0, total: int = 0,
     )
     em.set_author(name=company)
 
-    if location: em.add_field(name="📍 Location", value=location,  inline=True)
+    if location: em.add_field(name="📍 Location", value=location[:1000],  inline=True)
     if term:     em.add_field(name="📅 Term",     value=term,       inline=True)
     if salary:   em.add_field(name="💰 Salary",   value=salary,     inline=True)
     if cat:      em.add_field(name="🏷️ Category", value=cat,        inline=True)
@@ -1671,7 +1696,16 @@ async def slash_check(interaction: discord.Interaction, company: str = ""):
         await interaction.response.send_message("Personal bot.", ephemeral=True); return
 
     if company:
-        # Single-company scan
+        # Single-company scan — shares _scan_lock with the periodic scan so
+        # the two can't write to the DB concurrently (SQLite has no WAL mode
+        # configured here, so concurrent writers can throw "database is
+        # locked", which would otherwise get misattributed as a scrape
+        # failure against whatever company happened to be scanning).
+        if _scan_lock.locked():
+            await interaction.response.send_message(
+                "⏳ A scan is already running — wait for it to finish.", ephemeral=True
+            )
+            return
         await interaction.response.send_message(
             f"🔍 Scanning **{company}**...", ephemeral=True
         )
@@ -1686,60 +1720,65 @@ async def slash_check(interaction: discord.Interaction, company: str = ""):
             run_all_scrapers(on_batch=_capture)
             return results
 
-        raw = await loop.run_in_executor(None, _single_scan)
+        async with _scan_lock:
+            raw = await loop.run_in_executor(None, _single_scan)
 
-        # Filter and insert matching jobs
-        _skip_ids   = db.get_skipped_job_ids(str(MY_USER_ID))
-        _skip_urls  = db.get_all_job_urls(str(MY_USER_ID))
-        _skip_tkeys: set[str] = set()
-        for _sjid in _skip_ids:
-            _sjob = db.get_job(_sjid)
-            if _sjob:
-                _skip_tkeys.add(_title_key(_sjob.get("company", ""), _sjob.get("title", "")))
+            # Filter and insert matching jobs
+            _skip_ids   = db.get_skipped_job_ids(str(MY_USER_ID))
+            _skip_urls  = db.get_all_job_urls(str(MY_USER_ID))
+            _skip_tkeys: set[str] = set()
+            for _sjid in _skip_ids:
+                _sjob = db.get_job(_sjid)
+                if _sjob:
+                    _skip_tkeys.add(_title_key(_sjob.get("company", ""), _sjob.get("title", "")))
 
-        new_count = 0
-        for job in raw:
-            if not _is_internship(job.get("title", "")):
-                continue
-            if not _2027_filter(job):
-                continue
-            tag_job(job)
-            match, _ = _matches_me(job)
-            if not match:
-                continue
-            jid  = job.get("job_id", "")
-            jurl = job.get("url", "")
-            tkey = _title_key(job.get("company", ""), job.get("title", ""))
-            if jid in _seen_job_ids:
-                continue
-            if jid in _skip_ids or jurl in _skip_urls or tkey in _skip_tkeys:
+            new_count = 0
+            for job in raw:
+                if not _is_internship(job.get("title", "")):
+                    continue
+                if not _2027_filter(job):
+                    continue
+                tag_job(job)
+                match, _ = _matches_me(job)
+                if not match:
+                    continue
+                jid  = job.get("job_id", "")
+                jurl = job.get("url", "")
+                tkey = _title_key(job.get("company", ""), job.get("title", ""))
+                if jid in _seen_job_ids:
+                    continue
+                if jid in _skip_ids or jurl in _skip_urls or tkey in _skip_tkeys:
+                    _seen_job_ids.add(jid)
+                    if jurl:
+                        _seen_urls.add(jurl)
+                    continue
+                if db.job_exists(jid) or (jurl and db.job_exists_by_url_any(jurl)):
+                    _seen_job_ids.add(jid)
+                    if jurl:
+                        _seen_urls.add(jurl)
+                    continue
+                if tkey in _seen_title_keys or (jurl and jurl in _seen_urls):
+                    continue
+                _seen_title_keys.add(tkey)
                 _seen_job_ids.add(jid)
-                continue
-            if db.job_exists(jid) or (jurl and db.job_exists_by_url_any(jurl)):
-                _seen_job_ids.add(jid)
-                continue
-            if tkey in _seen_title_keys or (jurl and jurl in _seen_urls):
-                continue
-            _seen_title_keys.add(tkey)
-            _seen_job_ids.add(jid)
-            if jurl:
-                _seen_urls.add(jurl)
-            db.insert_job(
-                jid,
-                job.get("company", ""), job.get("source", ""),
-                job.get("title", ""),   job.get("location", ""),
-                job.get("url", ""),
-                description=job.get("description", ""),
-                category=job.get("category"),
-                subcategory=job.get("subcategory"),
-                term=job.get("term"),
-                deadline=job.get("deadline"),
-                salary=job.get("salary"),
-            )
-            new_count += 1
+                if jurl:
+                    _seen_urls.add(jurl)
+                db.insert_job(
+                    jid,
+                    job.get("company", ""), job.get("source", ""),
+                    job.get("title", ""),   job.get("location", ""),
+                    job.get("url", ""),
+                    description=job.get("description", ""),
+                    category=job.get("category"),
+                    subcategory=job.get("subcategory"),
+                    term=job.get("term"),
+                    deadline=job.get("deadline"),
+                    salary=job.get("salary"),
+                )
+                new_count += 1
 
-        if new_count:
-            await _update_summary(new_count=new_count)
+            if new_count:
+                await _update_summary(new_count=new_count)
 
         found_msg = f"**{new_count} new match{'es' if new_count != 1 else ''}**" if new_count else "no new matches"
         await interaction.followup.send(
